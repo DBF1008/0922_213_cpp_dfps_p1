@@ -16,6 +16,7 @@
 
 #include <getopt.h>
 #include <iostream>
+#include <signal.h>
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
@@ -102,7 +103,11 @@ void AppSigHandler(int sig) {
 
 void SetSigHandler(void) { signal(TERM_SIG, AppSigHandler); }
 
-void StartNewApp(void) {
+// Fork a candidate instance and health-check it during a short grace period.
+// Returns true only if the candidate is still alive after the check,
+// which means the config was loaded successfully.
+bool SpawnApp(void) {
+    dead_pid = 0;
     new_pid = fork();
     if (new_pid == 0) {
         SetSigHandler();
@@ -110,10 +115,14 @@ void StartNewApp(void) {
     }
 
     Sleep(SToUs(1.0));
-    if (new_pid != dead_pid) {
+    return new_pid != dead_pid;
+}
+
+void StartNewApp(void) {
+    if (SpawnApp()) {
         old_pid = new_pid;
     } else {
-        SPDLOG_INFO("Failed to start {}(pid={})", PROC_NAME, new_pid);
+        SPDLOG_ERROR("Failed to start {}(pid={}), waiting for a valid config", PROC_NAME, new_pid);
     }
 }
 
@@ -121,6 +130,24 @@ void KillOldApp(void) {
     if (old_pid) {
         kill(old_pid, TERM_SIG);
     }
+}
+
+// Reload with keepalive semantics: the new instance must prove itself by
+// surviving config loading before the old one is stopped. If the new config
+// is invalid, the old instance keeps running with the previous config, so a
+// bad config never takes the whole service down.
+void ReloadApp(void) {
+    if (SpawnApp() == false) {
+        if (old_pid) {
+            SPDLOG_ERROR("Invalid new config, {}(pid={}) keeps running with the previous config", PROC_NAME, old_pid);
+        } else {
+            SPDLOG_ERROR("Invalid config, {} is still waiting for a valid config", PROC_NAME);
+        }
+        return;
+    }
+    KillOldApp();
+    old_pid = new_pid;
+    SPDLOG_INFO("{}(pid={}) reloaded with the new config", PROC_NAME, old_pid);
 }
 
 void DaemonSigHandler(int signum) {
@@ -163,10 +190,8 @@ void Daemon(void) {
 
     for (;;) {
         inotify.WaitAndHandle();
-        SPDLOG_INFO("Config file updated, restart {} to load new config file", PROC_NAME);
-        KillOldApp();
-        Sleep(SToUs(0.5)); // wait finishing termination
-        StartNewApp();
+        SPDLOG_INFO("Config file updated, reloading {}", PROC_NAME);
+        ReloadApp();
     }
 }
 
