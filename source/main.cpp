@@ -16,6 +16,7 @@
 
 #include <getopt.h>
 #include <iostream>
+#include <csignal>
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
@@ -102,8 +103,15 @@ void AppSigHandler(int sig) {
 
 void SetSigHandler(void) { signal(TERM_SIG, AppSigHandler); }
 
-void StartNewApp(void) {
+// Returns true only when the new instance survives the health-check window,
+// which means the config was loaded without throwing.
+bool StartNewApp(void) {
+    dead_pid = 0; // drop stale records so a reused pid is not misjudged
     new_pid = fork();
+    if (new_pid < 0) {
+        SPDLOG_ERROR("Cannot fork a new {} instance", PROC_NAME);
+        return false;
+    }
     if (new_pid == 0) {
         SetSigHandler();
         AppMain();
@@ -112,14 +120,23 @@ void StartNewApp(void) {
     Sleep(SToUs(1.0));
     if (new_pid != dead_pid) {
         old_pid = new_pid;
-    } else {
-        SPDLOG_INFO("Failed to start {}(pid={})", PROC_NAME, new_pid);
+        return true;
     }
+    SPDLOG_ERROR("Failed to start {}(pid={})", PROC_NAME, new_pid);
+    return false;
 }
 
-void KillOldApp(void) {
-    if (old_pid) {
-        kill(old_pid, TERM_SIG);
+// Reload with keep-alive semantics: start the new instance first and retire
+// the previous one only after the new one proves the new config is loadable.
+// A broken config therefore never takes the running instance down.
+void ReloadApp(void) {
+    pid_t prev_pid = old_pid;
+    if (StartNewApp()) {
+        if (prev_pid != 0 && prev_pid != old_pid) {
+            kill(prev_pid, TERM_SIG);
+        }
+    } else if (prev_pid != 0) {
+        SPDLOG_ERROR("New config is not loadable, keep the previous {}(pid={}) running", PROC_NAME, prev_pid);
     }
 }
 
@@ -128,16 +145,19 @@ void DaemonSigHandler(int signum) {
     int status;
     switch (signum) {
         case SIGCHLD:
-            child_pid = wait(&status);
-            if (child_pid != new_pid && child_pid != old_pid) {
-                return;
-            }
-            dead_pid = child_pid;
-            if (WIFSIGNALED(status)) {
-                SPDLOG_ERROR("{}(pid={}) terminated unexpectedly, try to get tombstone", PROC_NAME, dead_pid);
-                // wait tombstone generated
-                Sleep(SToUs(1.0));
-                PrintTombstone(dead_pid);
+            // reap every exited child: the retired instance and a crashed new
+            // instance may terminate at almost the same time
+            while ((child_pid = waitpid(-1, &status, WNOHANG)) > 0) {
+                if (child_pid != new_pid && child_pid != old_pid) {
+                    continue;
+                }
+                dead_pid = child_pid;
+                if (WIFSIGNALED(status)) {
+                    SPDLOG_ERROR("{}(pid={}) terminated unexpectedly, try to get tombstone", PROC_NAME, dead_pid);
+                    // wait tombstone generated
+                    Sleep(SToUs(1.0));
+                    PrintTombstone(dead_pid);
+                }
             }
             break;
         case SIGTERM:
@@ -163,10 +183,8 @@ void Daemon(void) {
 
     for (;;) {
         inotify.WaitAndHandle();
-        SPDLOG_INFO("Config file updated, restart {} to load new config file", PROC_NAME);
-        KillOldApp();
-        Sleep(SToUs(0.5)); // wait finishing termination
-        StartNewApp();
+        SPDLOG_INFO("Config file updated, reload {} with the new config file", PROC_NAME);
+        ReloadApp();
     }
 }
 
